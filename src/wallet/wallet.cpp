@@ -149,16 +149,18 @@ CPubKey CWallet::GenerateNewKey(CWalletDB &walletdb, bool internal)
     bool fCompressed = CanSupportFeature(FEATURE_COMPRPUBKEY); // default to compressed public keys if we want 0.6.0 wallets
 
     CKey secret;
-
+    CPubKey pubkey;
     // Create new metadata
     int64_t nCreationTime = GetTime();
     CKeyMetadata metadata(nCreationTime);
 
     // use HD key derivation if HD was enabled during wallet creation
     if (IsHDEnabled()) {
-        DeriveNewChildKey(walletdb, metadata, secret, (CanSupportFeature(FEATURE_HD_SPLIT) ? internal : false));
+        DeriveNewChildKey(walletdb, metadata, secret, pubkey, (CanSupportFeature(FEATURE_HD_SPLIT) ? internal : false));
     } else {
         secret.MakeNewKey(fCompressed);
+        pubkey = secret.GetPubKey();
+        assert(secret.VerifyPubKey(pubkey));
     }
 
     // Compressed public keys were introduced in version 0.6.0
@@ -166,62 +168,97 @@ CPubKey CWallet::GenerateNewKey(CWalletDB &walletdb, bool internal)
         SetMinVersion(FEATURE_COMPRPUBKEY);
     }
 
-    CPubKey pubkey = secret.GetPubKey();
-    assert(secret.VerifyPubKey(pubkey));
-
     mapKeyMetadata[pubkey.GetID()] = metadata;
     UpdateTimeFirstKey(nCreationTime);
 
-    if (!AddKeyPubKeyWithDB(walletdb, secret, pubkey)) {
-        throw std::runtime_error(std::string(__func__) + ": AddKey failed");
+    if(!IsExternalHD()) {
+        if (!AddKeyPubKeyWithDB(walletdb, secret, pubkey)) {
+            throw std::runtime_error(std::string(__func__) + ": AddKey failed");
+        }
+    }
+    else {
+        if (!AddWatchOnly(pubkey, metadata, nCreationTime))
+            throw std::runtime_error(std::string(__func__) + ": AddWatchOnly failed");
     }
     return pubkey;
 }
 
-void CWallet::DeriveNewChildKey(CWalletDB &walletdb, CKeyMetadata& metadata, CKey& secret, bool internal)
+
+void CWallet::DeriveNewChildKey(CWalletDB &walletdb, CKeyMetadata& metadata, CKey& secret, CPubKey& pubkey, bool internal)
 {
-    // for now we use a fixed keypath scheme of m/0'/0'/k
     CKey key;                      //master key seed (256bit)
-    CExtKey masterKey;             //hd master key
-    CExtKey accountKey;            //key at m/0'
-    CExtKey chainChildKey;         //key at m/0'/0' (external) or m/0'/1' (internal)
-    CExtKey childKey;              //key at m/0'/0'/<n>'
-
     // try to get the master key
-    if (!GetKey(hdChain.masterKeyID, key))
+    if (GetKey(hdChain.masterKeyID, key))
+    {
+        // for now we use a fixed keypath scheme of m/0'/0'/k
+        CExtKey masterKey;             //hd master key
+        CExtKey accountKey;            //key at m/0'
+        CExtKey chainChildKey;         //key at m/0'/0' (external) or m/0'/1' (internal)
+        CExtKey childKey;              //key at m/0'/0'/<n>'
+
+        masterKey.SetMaster(key.begin(), key.size());
+
+        // derive m/0'
+        // use hardened derivation (child keys >= 0x80000000 are hardened after bip32)
+        masterKey.Derive(accountKey, BIP32_HARDENED_KEY_LIMIT);
+
+        // derive m/0'/0' (external chain) OR m/0'/1' (internal chain)
+        assert(internal ? CanSupportFeature(FEATURE_HD_SPLIT) : true);
+        accountKey.Derive(chainChildKey, BIP32_HARDENED_KEY_LIMIT + (internal ? 1 : 0));
+
+        // derive child key at next index, skip keys already known to the wallet
+        do {
+            // always derive hardened keys
+            // childIndex | BIP32_HARDENED_KEY_LIMIT = derive childIndex in hardened child-index-range
+            // example: 1 | BIP32_HARDENED_KEY_LIMIT == 0x80000001 == 2147483649
+            if (internal) {
+                chainChildKey.Derive(childKey, hdChain.nInternalChainCounter | BIP32_HARDENED_KEY_LIMIT);
+                metadata.hdKeypath = "m/0'/1'/" + std::to_string(hdChain.nInternalChainCounter) + "'";
+                hdChain.nInternalChainCounter++;
+            }
+            else {
+                chainChildKey.Derive(childKey, hdChain.nExternalChainCounter | BIP32_HARDENED_KEY_LIMIT);
+                metadata.hdKeypath = "m/0'/0'/" + std::to_string(hdChain.nExternalChainCounter) + "'";
+                hdChain.nExternalChainCounter++;
+            }
+        } while (HaveKey(childKey.key.GetPubKey().GetID()));
+        secret = childKey.key;
+        pubkey = childKey.key.GetPubKey();
+        metadata.hdMasterKeyID = hdChain.masterKeyID;
+        // update the chain model in the database
+        if (!walletdb.WriteHDChain(hdChain))
+            throw std::runtime_error(std::string(__func__) + ": Writing HD chain model failed");
+    }
+    else if (IsExternalHD()) {
+        CExtPubKey& masterKey = hdChain.externalHD;             //hd master key
+        CExtPubKey chainChildKey;         //key at m/0 (external) or m/1 (internal)
+        CExtPubKey childKey;              //key at m/0/<n>
+
+        // derive m/x
+        masterKey.Derive(chainChildKey, internal ? 1 : 0);
+
+        // derive child key at next index, skip keys already known to the wallet
+        do {
+            if (internal) {
+                chainChildKey.Derive(childKey, hdChain.nInternalChainCounter);
+                metadata.hdKeypath = "m/1/" + std::to_string(hdChain.nInternalChainCounter);
+                hdChain.nInternalChainCounter++;
+            }
+            else {
+                chainChildKey.Derive(childKey, hdChain.nExternalChainCounter);
+                metadata.hdKeypath = "m/0/" + std::to_string(hdChain.nExternalChainCounter);
+                hdChain.nExternalChainCounter++;
+            }
+            metadata.hdMasterKeyID = hdChain.masterKeyID;
+        } while (HaveWatchOnly(childKey.pubkey.GetID()));
+        pubkey = childKey.pubkey;
+        // update the chain model in the database
+        if (!walletdb.WriteHDChain(hdChain))
+            throw std::runtime_error(std::string(__func__) + ": Writing HD chain model failed");
+    }
+    else {
         throw std::runtime_error(std::string(__func__) + ": Master key not found");
-
-    masterKey.SetMaster(key.begin(), key.size());
-
-    // derive m/0'
-    // use hardened derivation (child keys >= 0x80000000 are hardened after bip32)
-    masterKey.Derive(accountKey, BIP32_HARDENED_KEY_LIMIT);
-
-    // derive m/0'/0' (external chain) OR m/0'/1' (internal chain)
-    assert(internal ? CanSupportFeature(FEATURE_HD_SPLIT) : true);
-    accountKey.Derive(chainChildKey, BIP32_HARDENED_KEY_LIMIT+(internal ? 1 : 0));
-
-    // derive child key at next index, skip keys already known to the wallet
-    do {
-        // always derive hardened keys
-        // childIndex | BIP32_HARDENED_KEY_LIMIT = derive childIndex in hardened child-index-range
-        // example: 1 | BIP32_HARDENED_KEY_LIMIT == 0x80000001 == 2147483649
-        if (internal) {
-            chainChildKey.Derive(childKey, hdChain.nInternalChainCounter | BIP32_HARDENED_KEY_LIMIT);
-            metadata.hdKeypath = "m/0'/1'/" + std::to_string(hdChain.nInternalChainCounter) + "'";
-            hdChain.nInternalChainCounter++;
-        }
-        else {
-            chainChildKey.Derive(childKey, hdChain.nExternalChainCounter | BIP32_HARDENED_KEY_LIMIT);
-            metadata.hdKeypath = "m/0'/0'/" + std::to_string(hdChain.nExternalChainCounter) + "'";
-            hdChain.nExternalChainCounter++;
-        }
-    } while (HaveKey(childKey.key.GetPubKey().GetID()));
-    secret = childKey.key;
-    metadata.hdMasterKeyID = hdChain.masterKeyID;
-    // update the chain model in the database
-    if (!walletdb.WriteHDChain(hdChain))
-        throw std::runtime_error(std::string(__func__) + ": Writing HD chain model failed");
+    }
 }
 
 bool CWallet::AddKeyPubKeyWithDB(CWalletDB &walletdb, const CKey& secret, const CPubKey &pubkey)
@@ -350,6 +387,29 @@ bool CWallet::AddWatchOnly(const CScript& dest, int64_t nCreateTime)
 {
     mapKeyMetadata[CScriptID(dest)].nCreateTime = nCreateTime;
     return AddWatchOnly(dest);
+}
+
+bool CWallet::AddWatchOnly(const CPubKey &pubkey, const CKeyMetadata& meta, int64_t nCreateTime)
+{
+    auto script = GetScriptForDestination(pubkey.GetID());
+    if (!HaveWatchOnly(script))
+    {
+        mapKeyMetadata[CScriptID(script)] = meta;
+        if (!AddWatchOnly(script, nCreateTime))
+            return false;
+    }
+
+    if (!CWalletDB(*dbw).WriteKeyMeta(pubkey, meta))
+        return false;
+
+    script = GetScriptForRawPubKey(pubkey);
+    if (!HaveWatchOnly(script))
+    {
+        mapKeyMetadata[CScriptID(script)] = meta;
+        if (!AddWatchOnly(script, nCreateTime))
+            return false;
+    }
+    return true;
 }
 
 bool CWallet::RemoveWatchOnly(const CScript &dest)
@@ -1483,6 +1543,25 @@ bool CWallet::SetHDMasterKey(const CPubKey& pubkey)
     return true;
 }
 
+bool CWallet::SetExternalHD(const CExtPubKey& extPubKey)
+{
+    LOCK(cs_wallet);
+
+    // ensure this wallet.dat can only be opened by clients supporting HD
+    SetMinVersion(FEATURE_EXTERNAL_HD);
+
+    // store the keyid (hash160) together with
+    // the child index counter in the database
+    // as a hdchain object
+    CHDChain newHdChain;
+    newHdChain.masterKeyID = extPubKey.pubkey.GetID();
+    newHdChain.isExternalHD = true;
+    newHdChain.externalHD = extPubKey;
+    SetHDChain(newHdChain, false);
+
+    return true;
+}
+
 bool CWallet::SetHDChain(const CHDChain& chain, bool memonly)
 {
     LOCK(cs_wallet);
@@ -1496,6 +1575,11 @@ bool CWallet::SetHDChain(const CHDChain& chain, bool memonly)
 bool CWallet::IsHDEnabled() const
 {
     return !hdChain.masterKeyID.IsNull();
+}
+
+bool CWallet::IsExternalHD() const
+{
+    return IsHDEnabled() && hdChain.isExternalHD;
 }
 
 int64_t CWalletTx::GetTxTime() const
@@ -3341,8 +3425,13 @@ void CWallet::ReserveKeyFromKeyPool(int64_t& nIndex, CKeyPool& keypool, bool fRe
         if (!walletdb.ReadPool(nIndex, keypool)) {
             throw std::runtime_error(std::string(__func__) + ": read failed");
         }
-        if (!HaveKey(keypool.vchPubKey.GetID())) {
+        if (!IsExternalHD() && !HaveKey(keypool.vchPubKey.GetID())) {
             throw std::runtime_error(std::string(__func__) + ": unknown key in key pool");
+        }
+        if (IsExternalHD()) {
+            if (!HaveWatchOnly(keypool.vchPubKey.GetID())) {
+                throw std::runtime_error(std::string(__func__) + ": unknown key in key pool");
+            }
         }
         if (keypool.fInternal != fReturningInternal) {
             throw std::runtime_error(std::string(__func__) + ": keypool entry misclassified");
@@ -3848,6 +3937,47 @@ std::vector<std::string> CWallet::GetDestValues(const std::string& prefix) const
     return values;
 }
 
+std::string CWallet::GetWalletHelpString(bool showDebug)
+{
+    std::string strUsage = HelpMessageGroup(_("Wallet options:"));
+    strUsage += HelpMessageOpt("-disablewallet", _("Do not load the wallet and disable wallet RPC calls"));
+    strUsage += HelpMessageOpt("-keypool=<n>", strprintf(_("Set key pool size to <n> (default: %u)"), DEFAULT_KEYPOOL_SIZE));
+    strUsage += HelpMessageOpt("-fallbackfee=<amt>", strprintf(_("A fee rate (in %s/kB) that will be used when fee estimation has insufficient data (default: %s)"),
+                                                               CURRENCY_UNIT, FormatMoney(DEFAULT_FALLBACK_FEE)));
+    strUsage += HelpMessageOpt("-discardfee=<amt>", strprintf(_("The fee rate (in %s/kB) that indicates your tolerance for discarding change by adding it to the fee (default: %s). "
+                                                                "Note: An output is discarded if it is dust at this rate, but we will always discard up to the dust relay fee and a discard fee above that is limited by the fee estimate for the longest target"),
+                                                              CURRENCY_UNIT, FormatMoney(DEFAULT_DISCARD_FEE)));
+    strUsage += HelpMessageOpt("-mintxfee=<amt>", strprintf(_("Fees (in %s/kB) smaller than this are considered zero fee for transaction creation (default: %s)"),
+                                                            CURRENCY_UNIT, FormatMoney(DEFAULT_TRANSACTION_MINFEE)));
+    strUsage += HelpMessageOpt("-paytxfee=<amt>", strprintf(_("Fee (in %s/kB) to add to transactions you send (default: %s)"),
+                                                            CURRENCY_UNIT, FormatMoney(payTxFee.GetFeePerK())));
+    strUsage += HelpMessageOpt("-rescan", _("Rescan the block chain for missing wallet transactions on startup"));
+    strUsage += HelpMessageOpt("-salvagewallet", _("Attempt to recover private keys from a corrupt wallet on startup"));
+    strUsage += HelpMessageOpt("-spendzeroconfchange", strprintf(_("Spend unconfirmed change when sending transactions (default: %u)"), DEFAULT_SPEND_ZEROCONF_CHANGE));
+    strUsage += HelpMessageOpt("-txconfirmtarget=<n>", strprintf(_("If paytxfee is not set, include enough fee so transactions begin confirmation on average within n blocks (default: %u)"), DEFAULT_TX_CONFIRM_TARGET));
+    strUsage += HelpMessageOpt("-usehd", _("Use hierarchical deterministic key generation (HD) after BIP32. Only has effect during wallet creation/first start") + " " + strprintf(_("(default: %u)"), DEFAULT_USE_HD_WALLET));
+    strUsage += HelpMessageOpt("-externalhd", _("Create a new external-HD wallet from a BIP32 HD public key"));
+    strUsage += HelpMessageOpt("-walletrbf", strprintf(_("Send transactions with full-RBF opt-in enabled (default: %u)"), DEFAULT_WALLET_RBF));
+    strUsage += HelpMessageOpt("-upgradewallet", _("Upgrade wallet to latest format on startup"));
+    strUsage += HelpMessageOpt("-wallet=<file>", _("Specify wallet file (within data directory)") + " " + strprintf(_("(default: %s)"), DEFAULT_WALLET_DAT));
+    strUsage += HelpMessageOpt("-walletbroadcast", _("Make the wallet broadcast transactions") + " " + strprintf(_("(default: %u)"), DEFAULT_WALLETBROADCAST));
+    strUsage += HelpMessageOpt("-walletnotify=<cmd>", _("Execute command when a wallet transaction changes (%s in cmd is replaced by TxID)"));
+    strUsage += HelpMessageOpt("-zapwallettxes=<mode>", _("Delete all wallet transactions and only recover those parts of the blockchain through -rescan on startup") +
+                               " " + _("(1 = keep tx meta data e.g. account owner and payment request information, 2 = drop tx meta data)"));
+
+    if (showDebug)
+    {
+        strUsage += HelpMessageGroup(_("Wallet debugging/testing options:"));
+
+        strUsage += HelpMessageOpt("-dblogsize=<n>", strprintf("Flush wallet database activity from memory to disk log every <n> megabytes (default: %u)", DEFAULT_WALLET_DBLOGSIZE));
+        strUsage += HelpMessageOpt("-flushwallet", strprintf("Run a thread to flush wallet periodically (default: %u)", DEFAULT_FLUSHWALLET));
+        strUsage += HelpMessageOpt("-privdb", strprintf("Sets the DB_PRIVATE flag in the wallet db environment (default: %u)", DEFAULT_WALLET_PRIVDB));
+        strUsage += HelpMessageOpt("-walletrejectlongchains", strprintf(_("Wallet will not create transactions that violate mempool chain limits (default: %u)"), DEFAULT_WALLET_REJECT_LONG_CHAINS));
+    }
+
+    return strUsage;
+}
+
 CWallet* CWallet::CreateWalletFromFile(const std::string walletFile)
 {
     // needed to restore wallet transaction meta data after -zapwallettxes
@@ -3918,12 +4048,44 @@ CWallet* CWallet::CreateWalletFromFile(const std::string walletFile)
         walletInstance->SetMaxVersion(nMaxVersion);
     }
 
+
+    std::string externalHd = gArgs.GetArg("-externalhd", "");
+    CExtPubKey extPubKey;
+    if (!externalHd.empty()) {
+        CBitcoinExtPubKey bitcoinExtPubKey(externalHd);
+        extPubKey = bitcoinExtPubKey.GetKey();
+        if (!extPubKey.pubkey.IsFullyValid()) {
+            InitError(_("Invalid ExtPubKey format"));
+            return NULL;
+        }
+        
+        if (!fFirstRun) {
+            if (!walletInstance->IsExternalHD() ||
+                walletInstance->GetHDChain().masterKeyID != extPubKey.pubkey.GetID()) {
+                InitError(_("Cannot specify new external hd on an already existing wallet"));
+                return NULL;
+            }
+        }
+    }
+
     if (fFirstRun)
     {
-        // ensure this wallet.dat can only be opened by clients supporting HD with chain split and expects no default key
-        if (!gArgs.GetBoolArg("-usehd", true)) {
-            InitError(strprintf(_("Error creating %s: You can't create non-HD wallets with this version."), walletFile));
-            return nullptr;
+        // Create new keyUser and set as default key
+        if (gArgs.GetBoolArg("-usehd", DEFAULT_USE_HD_WALLET) && !walletInstance->IsHDEnabled()) {
+
+            // ensure this wallet.dat can only be opened by clients supporting HD with chain split
+            walletInstance->SetMinVersion(FEATURE_HD_SPLIT);
+
+            // generate a new master key
+            if(externalHd.empty()) {
+                CPubKey masterPubKey = walletInstance->GenerateNewHDMasterKey();
+                if (!walletInstance->SetHDMasterKey(masterPubKey))
+                    throw std::runtime_error(std::string(__func__) + ": Storing master key failed");
+            }
+            else {
+                if (!walletInstance->SetExternalHD(extPubKey))
+                    throw std::runtime_error(std::string(__func__) + ": Storing master key failed");
+            }
         }
         walletInstance->SetMinVersion(FEATURE_NO_DEFAULT_KEY);
 
