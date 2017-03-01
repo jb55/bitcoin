@@ -161,6 +161,13 @@ CScript GetScriptForRawPubKey(const CPubKey& pubkey);
 /** Generate a multisig script. */
 CScript GetScriptForMultisig(int nRequired, const std::vector<CPubKey>& keys);
 
+CScript GetScriptForHTLC(const CPubKey& seller,
+                         const CPubKey& refund,
+                         const std::vector<unsigned char> image,
+                         uint32_t timeout,
+                         opcodetype hasher_type,
+                         opcodetype timeout_type);
+
 /**
  * Generate a pay-to-witness script for the given redeem script. If the redeem
  * script is P2PK or P2PKH, this returns a P2WPKH script, otherwise it returns a
