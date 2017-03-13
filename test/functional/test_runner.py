@@ -127,6 +127,7 @@ BASE_SCRIPTS= [
     'p2p-fingerprint.py',
     'uacomment.py',
     'p2p-acceptblock.py',
+    'externalhd.py'
 ]
 
 EXTENDED_SCRIPTS = [
