@@ -30,6 +30,7 @@
 #include <util/check.h> // For NDEBUG compile time check
 #include <util/strencodings.h>
 #include <util/system.h>
+#include <util/trace.h>
 #include <validation.h>
 
 #include <memory>
@@ -4043,6 +4044,13 @@ bool PeerManagerImpl::ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt
         fMoreWork = !pfrom->vProcessMsg.empty();
     }
     CNetMessage& msg(msgs.front());
+
+    TRACE5(net, process_message,
+           pfrom->addr.ToString().c_str(),
+           pfrom->GetId(),
+           msg.m_command.c_str(),
+           msg.m_recv.data(),
+           msg.m_recv.size());
 
     msg.SetVersion(pfrom->GetCommonVersion());
     const std::string& msg_type = msg.m_command;
